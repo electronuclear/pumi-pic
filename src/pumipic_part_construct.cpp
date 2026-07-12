@@ -37,6 +37,9 @@ namespace {
   void convertTag(Omega_h::Mesh full_mesh, Omega_h::Mesh* picpart, int dim,
                   Omega_h::LOs entToEnt, Omega_h::TagBase const* tag,
                   const char* new_name = "");
+  Omega_h::LOs ownedNumbering(Omega_h::Mesh& mesh, int dim);
+  Omega_h::GOs blockGids(Omega_h::LOs owners, Omega_h::LOs rank_offsets,
+                         Omega_h::LOs rank_lids);
 }
 
 namespace pumipic {
@@ -50,6 +53,139 @@ namespace pumipic {
     Omega_h::Write<Omega_h::LO> has_part(comm_size, 1);
     is_full_mesh = true;
     constructPICPart(mesh, comm, owner, has_part, is_safe);
+  }
+
+  /* Wraps each rank's piece of a genuinely distributed Omega_h mesh as a depth-0,
+   * core-only PICpart. The piece maps 1:1 onto the picpart (no extraction): the
+   * self-communicator picpart mesh copies the local connectivity, coordinates,
+   * classification, and tags verbatim, so the local entity numbering is the
+   * piece's own. Ownership comes from the Omega_h owners (consistent across the
+   * sharing ranks); the owner-contiguous global numbering is built by numbering
+   * each owner's owned entities in local order and synchronizing that numbering
+   * to the copies, so every sharing rank agrees on gids and rank_lids. Every
+   * local element is core and safe. The full mesh is never constructed. */
+  Mesh::Mesh(Omega_h::Mesh& mesh) {
+    Omega_h::CommPtr comm = mesh.comm();
+    int comm_size = comm->size();
+    int dim = mesh.dim();
+    is_full_mesh = false;
+    commptr = comm;
+    ptcl_balancer = NULL;
+
+    for (int i = 0; i < 4; ++i) {
+      num_cores[i] = 0;
+      num_bounds[i] = 0;
+      num_entites[i] = 0;
+      num_boundaries[i] = 0;
+      bounded_ent_ids[i] = Omega_h::LOs(0);
+      offset_ents_per_rank_per_dim[i] = Omega_h::LOs(0);
+      ent_to_comm_arr_index_per_dim[i] = Omega_h::LOs(0);
+      buffered_parts[i] = Omega_h::HostWrite<Omega_h::LO>(0);
+      boundary_parts[i] = Omega_h::HostWrite<Omega_h::LO>(0);
+      is_complete_part[i] = Omega_h::HostWrite<Omega_h::LO>(0);
+      offset_bounded_per_dim[i] = Omega_h::HostWrite<Omega_h::LO>(0);
+    }
+
+    /* Per-dimension partition arrays, consistent across the sharing ranks:
+     * ownership from the Omega_h owners; each owner numbers its owned entities
+     * 0..n_owned-1 in local order and the copies receive the owner's number
+     * (rank_lids); gids place that number inside the owner's block of the
+     * owner-contiguous numbering. */
+    Omega_h::LOs owner_dim[4];
+    Omega_h::GOs gids_dim[4];
+    Omega_h::LOs rank_lids_dim[4];
+    Omega_h::LOs rank_offset_nents[4];
+    for (int d = 0; d <= dim; ++d) {
+      owner_dim[d] = mesh.ask_owners(d).ranks;
+      rank_lids_dim[d] = ownedNumbering(mesh, d);
+
+      // Exclusive scan of the per-rank owned counts gives the block offsets of
+      // the owner-contiguous numbering; the total is the global entity count.
+      Omega_h::LOs owned_offset = Omega_h::offset_scan(mesh.owned(d));
+      Omega_h::HostRead<Omega_h::LO> owned_offset_host(owned_offset);
+      Omega_h::LO n_owned = owned_offset_host[owned_offset_host.size() - 1];
+      Omega_h::HostWrite<Omega_h::LO> counts_host(comm_size, "counts_host");
+      MPI_Allgather(&n_owned, 1, MPI_INT, counts_host.data(), 1, MPI_INT,
+                    comm->get_impl());
+      Omega_h::HostWrite<Omega_h::LO> offsets_host(comm_size + 1, "offsets_host");
+      offsets_host[0] = 0;
+      for (int r = 0; r < comm_size; ++r)
+        offsets_host[r + 1] = offsets_host[r] + counts_host[r];
+      num_entites[d] = offsets_host[comm_size];
+      rank_offset_nents[d] = Omega_h::LOs(offsets_host.write());
+
+      gids_dim[d] = blockGids(owner_dim[d], rank_offset_nents[d], rank_lids_dim[d]);
+    }
+
+    /* Build the self-communicator picpart as a 1:1 copy of the local piece:
+     * same entity counts, same local numbering, same downward adjacencies,
+     * coordinates, and classification. */
+    Omega_h::Library* lib = mesh.library();
+    picpart = new Omega_h::Mesh(lib);
+    picpart->set_comm(lib->self());
+    picpart->set_parting(OMEGA_H_ELEM_BASED);
+    picpart->set_dim(dim);
+    picpart->set_family(mesh.family());
+    picpart->set_verts(mesh.nverts());
+    for (int d = 1; d <= dim; ++d)
+      picpart->set_ents(d, mesh.ask_down(d, d - 1));
+    picpart->add_coords(mesh.coords());
+    for (int d = 0; d <= dim; ++d) {
+      picpart->add_tag<Omega_h::ClassId>(d, "class_id", 1,
+          mesh.get_array<Omega_h::ClassId>(d, "class_id"));
+      picpart->add_tag<Omega_h::I8>(d, "class_dim", 1,
+          mesh.get_array<Omega_h::I8>(d, "class_dim"));
+    }
+    Omega_h::finalize_classification(picpart);
+    if (!picpart->nelems()) {
+      printError("%s: empty part on rank %d\n", __func__, comm->rank());
+    }
+    assert(picpart->nelems());
+
+    /* Transfer the remaining tags verbatim (the numbering is 1:1). The Omega_h
+     * "global" ids, which the producer preserved from the serial mesh, are kept
+     * under both names the picpart convention uses. */
+    for (int d = 0; d <= dim; ++d) {
+      for (int t = 0; t < mesh.ntags(d); ++t) {
+        Omega_h::TagBase const* tagbase = mesh.get_tag(d, t);
+        const auto& name = tagbase->name();
+        if (name == "coordinates" || name == "class_id" || name == "class_dim")
+          continue;
+        const int ncomps = tagbase->ncomps();
+        if (name == "global") {
+          auto arr = mesh.get_array<Omega_h::GO>(d, "global");
+          picpart->add_tag(d, "global", ncomps, arr);
+          picpart->add_tag(d, "global_serial", ncomps, arr);
+          continue;
+        }
+        if (tagbase->type() == OMEGA_H_I8)
+          picpart->add_tag(d, name, ncomps, mesh.get_array<Omega_h::I8>(d, name));
+        else if (tagbase->type() == OMEGA_H_I32)
+          picpart->add_tag(d, name, ncomps, mesh.get_array<Omega_h::I32>(d, name));
+        else if (tagbase->type() == OMEGA_H_I64)
+          picpart->add_tag(d, name, ncomps, mesh.get_array<Omega_h::I64>(d, name));
+        else if (tagbase->type() == OMEGA_H_F64)
+          picpart->add_tag(d, name, ncomps, mesh.get_array<Omega_h::Real>(d, name));
+      }
+    }
+
+    // The PICpart partition tags, plus safe: every local element is core.
+    for (int d = 0; d <= dim; ++d) {
+      picpart->add_tag(d, "ownership", 1, owner_dim[d]);
+      picpart->add_tag(d, "gids", 1, gids_dim[d]);
+      picpart->add_tag(d, "rank_lids", 1, rank_lids_dim[d]);
+    }
+    picpart->add_tag(dim, "safe", 1,
+        Omega_h::LOs(Omega_h::Write<Omega_h::LO>(mesh.nelems(), 1, "safe")));
+
+    //**************** Build communication information ********************//
+    for (int d = 0; d <= dim; ++d) {
+      Omega_h::LOs picpart_offset_nents = calculateOwnerOffset(owner_dim[d], comm_size);
+      setupComm(d, rank_offset_nents[d], picpart_offset_nents, owner_dim[d]);
+    }
+
+    //Create load balancer
+    ptcl_balancer = new ParticleBalancer(*this);
   }
 
   Mesh::Mesh(Omega_h::Mesh& mesh, Omega_h::LOs owner, int ghost_layers, int safe_layers) {
@@ -371,6 +507,33 @@ namespace {
     GlobalNumberer gnr(comm_size, owner, rank_offset_nelms, elem_gid);
     Omega_h::parallel_scan(owner.size(), gnr);
     return rank_offset_nelms;
+  }
+
+  /* Numbers this rank's owned dim-entities 0..n_owned-1 in local order and gives
+   * every copy its owner's number, so the sharing ranks agree on each entity's
+   * position inside its owner's block. */
+  Omega_h::LOs ownedNumbering(Omega_h::Mesh& mesh, int dim) {
+    const Omega_h::LO nents = mesh.nents(dim);
+    auto owned = mesh.owned(dim);
+    auto owned_offset = Omega_h::offset_scan(owned);
+    Omega_h::Write<Omega_h::LO> own_idx(nents, -1, "own_idx");
+    auto numberOwned = OMEGA_H_LAMBDA(Omega_h::LO e) {
+      if (owned[e]) own_idx[e] = owned_offset[e];
+    };
+    Omega_h::parallel_for(nents, numberOwned, "numberOwned");
+    return mesh.sync_array(dim, Omega_h::LOs(own_idx), 1);
+  }
+
+  // The owner-contiguous global id: the entity's block offset plus its position
+  // inside the owner's block.
+  Omega_h::GOs blockGids(Omega_h::LOs owners, Omega_h::LOs rank_offsets,
+                         Omega_h::LOs rank_lids) {
+    Omega_h::Write<Omega_h::GO> gids(owners.size(), "gids_w");
+    auto numberGlobally = OMEGA_H_LAMBDA(Omega_h::LO e) {
+      gids[e] = rank_offsets[owners[e]] + rank_lids[e];
+    };
+    Omega_h::parallel_for(owners.size(), numberGlobally, "numberGlobally");
+    return Omega_h::GOs(gids);
   }
 
   Omega_h::LOs rankLidNumbering(Omega_h::LOs owners, Omega_h::LOs offset, Omega_h::GOs gids) {

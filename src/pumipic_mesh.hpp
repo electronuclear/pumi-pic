@@ -22,6 +22,13 @@ namespace pumipic {
          int buffer_layers, int safe_layers);
     //Create picparts from input structure
     Mesh(Input&);
+    /* Wraps each rank's piece of a genuinely distributed Omega_h mesh (ELEM_BASED
+     * parting on a multi-rank communicator) as a depth-0, core-only PICpart: every
+     * local element is core and safe, lower-dimension ownership comes from the
+     * Omega_h owners, and the owner-contiguous global numbering is built from each
+     * owner's owned-entity order and synchronized to the sharing ranks. The full
+     * mesh is never constructed. */
+    Mesh(Omega_h::Mesh& distributed_mesh);
     ~Mesh();
 
     //Returns true if the full mesh is buffered
